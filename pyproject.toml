@@ -1,0 +1,27 @@
+[project]
+name = "mychess"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Yusuf Bayraktar", email = "yusufbayraktar2006@outlook.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "chess>=1.11.2",
+    "pillow>=12.3.0",
+]
+
+[project.scripts]
+mychess = "mychess:main"
+
+[build-system]
+requires = ["uv_build>=0.12.2,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pyinstaller>=6.22.2",
+    "pytest>=9.1.1",
+    "ruff>=0.16.3",
+]
