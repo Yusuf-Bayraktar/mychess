@@ -67,10 +67,12 @@ cd mychess
 Using `uv`:
 
 ```bash
-uv sync
+uv sync --managed-python
 ```
 
-Or install the project with your preferred Python package manager.
+`--managed-python` makes uv use its own Python build, which includes Tkinter.
+
+> **macOS:** Homebrew's `python@3.14` ships **without** Tkinter (`_tkinter`), so the game cannot start with it. Use uv's managed Python as shown above (or run `uv python install 3.14` once). If `.venv` was already created with Homebrew's Python, delete it and run `uv sync --managed-python` again.
 
 ### Run the game
 
@@ -90,9 +92,27 @@ The project exposes `mychess` as a console script that starts the game.
 
 ## 🧠 Chess Engine
 
-`mychess` includes a Stockfish engine binary under the `engines/` directory.
+`mychess` includes a Windows Stockfish engine binary under the `engines/` directory.
 
-The engine is used to provide computer-player functionality and chess analysis.
+On macOS (and Linux), install Stockfish yourself:
+
+```bash
+brew install stockfish
+```
+
+The game looks for the engine in this order: the `MYCHESS_STOCKFISH` environment variable, the bundled engine, `stockfish` on `PATH`, then `/opt/homebrew/bin`, `/usr/local/bin` and `/usr/games`. Without an engine, two-player mode still works.
+
+The **Seviye (ELO)** (rating) option in the menu uses Stockfish's real Elo limit (`UCI_Elo`) when the engine supports that value (1350+ for Stockfish 15.1, 1320+ for newer versions); lower ratings are approximated with `Skill Level` and a search-depth limit.
+
+## 🪵 Logs
+
+When started with `uv run mychess` (or the packaged app), errors and game events are written to a rotating log file:
+
+- macOS: `~/Library/Logs/mychess/mychess.log`
+- Windows: `%LOCALAPPDATA%\mychess\logs\mychess.log`
+- Linux: `$XDG_STATE_HOME/mychess/mychess.log` (default `~/.local/state/mychess/`)
+
+Error dialogs show the log path when it is available.
 
 ## 🧪 Testing
 
@@ -104,15 +124,29 @@ uv run pytest
 
 ## 🔍 Code Quality
 
-Ruff is used for linting and maintaining code quality:
+Ruff is used for linting and mypy (strict mode) for type checking:
 
 ```bash
 uv run ruff check .
+uv run mypy
 ```
+
+GitHub Actions (`.github/workflows/ci.yml`) runs Ruff, mypy and the test suite on Linux, macOS and Windows for every push and pull request.
 
 ## 📸 Screenshots
 
-Screenshots of the application can be found in the [`screenshots`](./screenshots) directory.
+| Main menu | Playing against Stockfish |
+| :---: | :---: |
+| ![Main menu with mode, time control, ELO and side selection](screenshots/menu.png) | ![Game against Stockfish with clocks and move list](screenshots/vs-stockfish.png) |
+| **Pawn promotion** | **Checkmate** |
+| ![Pawn promotion dialog](screenshots/promotion.png) | ![Scholar's mate in two-player mode](screenshots/checkmate.png) |
+
+<details>
+<summary>Earlier version (Windows)</summary>
+
+![Earlier Windows version of the game](screenshots/windows-old-ui.png)
+
+</details>
 
 ## 📦 Building
 
@@ -127,10 +161,10 @@ This can be used to build a standalone executable for the application.
 For example:
 
 ```bash
-uv run pyinstaller Chess.spec
+uv run pyinstaller Chess.spec --noconfirm
 ```
 
-The exact output location depends on the PyInstaller configuration.
+The build is written to `dist/Chess/`. On macOS it also produces `dist/Chess.app`, with the Stockfish found on the build machine bundled inside.
 
 ## 🗺️ Roadmap
 
@@ -153,9 +187,9 @@ GitHub: [@Yusuf-Bayraktar](https://github.com/Yusuf-Bayraktar)
 
 ## 📄 License
 
-This project is currently distributed without a specified open-source license.
+mychess is licensed under the **GNU General Public License v3.0 or later** — see [`LICENSE`](./LICENSE).
 
-If you plan to publish or redistribute the project, consider adding a `LICENSE` file.
+It depends on [python-chess](https://github.com/niklasf/python-chess) (GPL-3.0+) and bundles [Stockfish](https://github.com/official-stockfish/Stockfish) (GPL-3.0) in packaged builds. Third-party licenses and source links are listed in [`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md); packaged builds include both files under `licenses/`.
 
 ---
 

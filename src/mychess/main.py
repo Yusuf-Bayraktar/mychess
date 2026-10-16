@@ -1,738 +1,440 @@
-import ctypes as ct
-import subprocess
+import logging
 import sys
-import threading
 import tkinter as tk
-from pathlib import Path
+from collections.abc import Callable
 from tkinter import messagebox, ttk
+from types import TracebackType
 
 import chess
-import chess.engine
-from PIL import Image, ImageTk
 
-from .const import (
-    ALPHABET,
-    BCOLOR,
-    COLS,
-    HCOLOR,
-    HEIGHT,
-    MBLACK,
-    MWHITE,
-    PIECES,
-    ROWS,
-    SQSIZE,
-    WCOLOR,
-    WIDTH,
-)
+from .board_view import BoardView
+from .clock import format_clock
+from .const import HEIGHT, WIDTH
+from .engine import ENGINE_ENV_VAR, EngineController
+from .game import COLOR_NAMES, TIME_CONTROLS, Game, GameMode, MoveRecord
+from .logging_config import log_hint, setup_logging
+from .resources import get_resource_path
+from .widgets import Popup, dark_title_bar
 
+logger = logging.getLogger(__name__)
 
-def get_resource_path(relative_path: str | Path) -> Path:
-    """Geliştirme ve PyInstaller (.exe) ortamlarında doğru kaynak yolunu çözümler."""
-    rel = Path(relative_path)
-
-    # 1. PyInstaller Onefile modu (_MEIPASS)
-    if hasattr(sys, "_MEIPASS"):
-        base_dir = Path(sys._MEIPASS)
-        cand_pkg = base_dir / "mychess" / rel
-        if cand_pkg.exists():
-            return cand_pkg
-        cand_root = base_dir / rel
-        if cand_root.exists():
-            return cand_root
-        return cand_pkg
-
-    # 2. PyInstaller Onedir modu (sys.executable dizini)
-    if getattr(sys, "frozen", False):
-        exe_dir = Path(sys.executable).resolve().parent
-        cand_root = exe_dir / rel
-        if cand_root.exists():
-            return cand_root
-        cand_pkg = exe_dir / "mychess" / rel
-        if cand_pkg.exists():
-            return cand_pkg
-        cand_src = exe_dir / "src" / "mychess" / rel
-        if cand_src.exists():
-            return cand_src
-        return cand_root
-
-    # 3. Geliştirme ortamı (Source / uv run)
-    package_dir = Path(__file__).resolve().parent
-    project_root = package_dir.parent.parent
-
-    candidate_pkg = package_dir / rel
-    if candidate_pkg.exists():
-        return candidate_pkg
-    candidate_root = project_root / rel
-    if candidate_root.exists():
-        return candidate_root
-
-    return candidate_pkg
+ENGINE_POLL_MS: int = 50
+# Saat gerçek zamanla ölçülür; bu yalnızca ekranın ve süre bitiminin kontrol sıklığı.
+CLOCK_TICK_MS: int = 100
+# Motor hamle üretemezse oyun durdurulmadan önce kaç kez yeniden başlatılır.
+MAX_ENGINE_RESTARTS: int = 1
+# Pencere küçültülünce tahta en fazla buraya kadar küçülür (kare 50 px).
+MIN_BOARD_SIZE: int = 400
+# Saat yazısı tahtayla büyür; çok büyüyüp yan paneli genişletmesin diye üst sınır.
+MAX_CLOCK_FONT: int = 32
+MOVE_LOG_ROWS: int = 6
 
 
-def get_engine_path(
-    engine_relative_path: str | Path = (
-        "engines/stockfish_15.1_win_x64_avx2/stockfish-windows-2022-x86-64-avx2.exe"
-    ),
-) -> Path:
-    """Stockfish motoru için çalıştırılabilir dosya yolunu belirler."""
-    rel = Path(engine_relative_path)
-
-    # 1. PyInstaller Onedir / Onefile modu
-    if getattr(sys, "frozen", False):
-        exe_dir = Path(sys.executable).resolve().parent
-        cand_root = exe_dir / rel
-        if cand_root.exists():
-            return cand_root
-        if hasattr(sys, "_MEIPASS"):
-            cand_mei = Path(sys._MEIPASS) / rel
-            if cand_mei.exists():
-                return cand_mei
-        return cand_root
-
-    # 2. Geliştirme ortamı
-    package_dir = Path(__file__).resolve().parent
-    project_root = package_dir.parent.parent
-    candidate = project_root / rel
-    if candidate.exists():
-        return candidate
-
-    return package_dir / rel
-
-
-PIECE_TYPE_NAMES: dict[chess.PieceType, str] = {
-    chess.PAWN: "pawn",
-    chess.KNIGHT: "knight",
-    chess.BISHOP: "bishop",
-    chess.ROOK: "rook",
-    chess.QUEEN: "queen",
-    chess.KING: "king",
-}
-
-
-def dark_title_bar(window: tk.Tk) -> None:
-    """Windows için koyu başlık çubuğu (Immersive Dark Mode) uygular."""
-    if sys.platform != "win32":
-        return
-    try:
-        window.update()
-        dwmwa_use_immersive_dark_mode = 20
-        set_window_attribute = ct.windll.dwmapi.DwmSetWindowAttribute
-        get_parent = ct.windll.user32.GetParent
-        hwnd = get_parent(window.winfo_id())
-        value = ct.c_int(2)
-        set_window_attribute(
-            hwnd,
-            dwmwa_use_immersive_dark_mode,
-            ct.byref(value),
-            ct.sizeof(value),
-        )
-    except (AttributeError, OSError):
-        pass
-
-
-class Popup(tk.Toplevel):
-    """Piyon terfisi (pawn promotion) için seçim penceresi."""
-
-    def __init__(
-        self,
-        parent: tk.Tk,
-        player_side: bool,
-        images: dict[str, ImageTk.PhotoImage],
-    ) -> None:
-        super().__init__(parent)
-        self.title("Terfi")
-        self.resizable(False, False)
-        self.choice: str | None = None
-        color = "white" if player_side else "black"
-
-        ttk.Button(
-            self,
-            image=images[f"queen_{color}"],
-            command=lambda: self.select("q"),
-        ).pack(side=tk.RIGHT)
-        ttk.Button(
-            self,
-            image=images[f"rook_{color}"],
-            command=lambda: self.select("r"),
-        ).pack(side=tk.RIGHT)
-        ttk.Button(
-            self,
-            image=images[f"bishop_{color}"],
-            command=lambda: self.select("b"),
-        ).pack(side=tk.RIGHT)
-        ttk.Button(
-            self,
-            image=images[f"knight_{color}"],
-            command=lambda: self.select("n"),
-        ).pack(side=tk.RIGHT)
-
-        self.protocol("WM_DELETE_WINDOW", self.cancel)
-        self.bind("<Escape>", lambda _e: self.cancel())
-
-        self.transient(parent)
-        self.grab_set()
-
-    def select(self, piece_char: str) -> None:
-        self.choice = piece_char
-        self.destroy()
-
-    def cancel(self) -> None:
-        """Terfi iptal edildiğinde seçimi sıfırlar ve pencereyi kapatır."""
-        self.choice = None
-        self.destroy()
+def clock_font_size(board_size: int) -> int:
+    """Saat yazısı tahtayla büyür ama `MAX_CLOCK_FONT`'u aşmaz."""
+    return min(board_size // 20, MAX_CLOCK_FONT)
+ELO_CHOICES: list[str] = ["400", "800", "1000", "1300", "1600", "2000", "2400", "2850"]
+DEFAULT_ELO: int = 1300
+# Menüde gösterilen taraf adı -> oyuncunun rengi
+SIDE_CHOICES: dict[str, chess.Color] = {"Beyaz": chess.WHITE, "Siyah": chess.BLACK}
 
 
 class ChessApp:
-    """Satranç uygulaması ana kontrolcüsü ve grafik arayüz yöneticisi."""
+    """Uygulama penceresi: menü, kenar çubuğu ve oyun akışı.
+
+    Oyun kuralları ve saat `Game`'de, tahta çizimi ve fare girişi
+    `BoardView`'da, Stockfish süreci `EngineController`'da; bu sınıf onları
+    birbirine bağlar ve kullanıcıya gösterir.
+    """
 
     def __init__(self) -> None:
         self.root = tk.Tk()
-        self.root.geometry(f"{WIDTH + 200}x{HEIGHT}")
-        self.root.minsize(WIDTH, HEIGHT)
         self.root.title("Chess by Yusuf")
-
-        # Tema ve Pencere Ayarları
-        theme_path = get_resource_path("ForestTheme/forest-dark.tcl")
-        if theme_path.exists():
-            try:
-                self.root.tk.call("source", str(theme_path))
-                ttk.Style().theme_use("forest-dark")
-            except tk.TclError:
-                pass
+        self.load_theme()
         dark_title_bar(self.root)
+        self.root.report_callback_exception = self.on_callback_error
+        self.callback_error_shown: bool = False
 
-        # Oyun Durumu
-        self.board = chess.Board()
-        self.moves: list[chess.Move] = []
-        self.legal_moves: list[chess.Move] = []
-        self.is_resume: bool = False
-        self.player_side: bool = True  # True: White, False: Black
-        self.game_mode: str = "Player"
+        # Menüde gösterilen oyun dışı "boş" oyun; her yeni oyun yeni kimlik alır.
+        self.last_game_id: int = 0
+        self.game = Game(self.last_game_id)
         self.is_stockfish_thinking: bool = False
+        self.engine_restarts: int = 0
+        self.engine = EngineController()
 
-        # Zamanlayıcılar (Saniye)
-        self.white_time: int = 600
-        self.black_time: int = 600
-        self.time_plus: int = 0
-        self.after_time_id: str | None = None
-
-        # Etkileşim ve Sürükleme Durumu
-        self.closest: int | None = None
-        self.prev_col: int | None = None
-        self.prev_row: int | None = None
-
-        # Motor ve Görsel Önbelleği
-        self.engine: chess.engine.SimpleEngine | None = None
-        self.engine_path = get_engine_path()
-        self.assets_dir = get_resource_path("assets")
-        self.raw_images: dict[str, Image.Image] = {}
-        self.re_images: dict[str, ImageTk.PhotoImage] = {}
-
-        # Menü Seçenekleri
-        self.mode_list = ["Player", "Stockfish"]
-        self.time_list = ["1+0", "3+2", "10+0"]
-        self.elo_list = [
-            "400",
-            "800",
-            "1000",
-            "1300",
-            "1600",
-            "2000",
-            "2400",
-            "2850",
-        ]
-        self.side_list = ["white", "black"]
-        self.depth_list = [1, 1, 3, 5, 7, 10, 13, 16, 20]
-
+        self.mode_list = [mode.value for mode in GameMode]
+        self.time_list = list(TIME_CONTROLS)
+        self.elo_list = ELO_CHOICES
+        self.side_list = list(SIDE_CHOICES)
         self.mode_var = tk.StringVar(value=self.mode_list[0])
         self.time_var = tk.StringVar(value=self.time_list[0])
-        self.elo_var = tk.StringVar(value=self.elo_list[3])
+        self.elo_var = tk.StringVar(value=str(DEFAULT_ELO))
         self.side_var = tk.StringVar(value=self.side_list[0])
 
-        self.load_raw_images()
-        self.init_engine()
+        self.engine.start_in_background()
         self.setup_ui()
-        self.resize_pieces()
-        self.redraw()
+        self.fit_window()
+        self.board_view.show(self.game.board, white_bottom=True)
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
-        self.after_time_id = self.root.after(1000, self.time_update)
+        self.after_time_id: str | None = self.root.after(
+            CLOCK_TICK_MS, self.time_update
+        )
+        self.after_poll_id: str | None = self.root.after(
+            ENGINE_POLL_MS, self.poll_engine
+        )
 
-    def load_raw_images(self) -> None:
-        """Taş görsellerini diskten yalnızca 1 kez RAM'e yükler (Disk I/O Optimizasyonu)."""
-        for piece in PIECES:
-            for color in ("white", "black"):
-                img_path = (
-                    self.assets_dir / "images" / "imgs-80px" / f"{color}_{piece}.png"
-                )
-                if img_path.exists():
-                    self.raw_images[f"{piece}_{color}"] = Image.open(
-                        str(img_path)
-                    ).convert("RGBA")
-
-    def resize_pieces(self) -> None:
-        """Yalnızca RAM'deki görselleri yeniden ölçeklendirir (Disk okuması yapmaz)."""
-        for key, raw_img in self.raw_images.items():
-            self.re_images[key] = ImageTk.PhotoImage(
-                raw_img.resize((SQSIZE, SQSIZE), Image.Resampling.BILINEAR)
-            )
-
-    def init_engine(self) -> None:
-        """Stockfish motorunu güvenli bir şekilde başlatır."""
+    def load_theme(self) -> None:
+        """Forest (koyu) ttk temasını yükler; olmazsa varsayılan temayla devam eder."""
+        theme_path = get_resource_path("ForestTheme/forest-dark.tcl")
+        if not theme_path.exists():
+            logger.warning("Tema dosyası bulunamadı: %s", theme_path)
+            return
         try:
-            if self.engine_path.exists():
-                startupinfo = (
-                    subprocess.STARTUPINFO(
-                        dwFlags=subprocess.STARTF_USESHOWWINDOW
-                    )
-                    if sys.platform == "win32"
-                    else None
-                )
-                self.engine = chess.engine.SimpleEngine.popen_uci(
-                    str(self.engine_path),
-                    startupinfo=startupinfo,
-                )
-        except (
-            chess.engine.EngineError,
-            FileNotFoundError,
-            PermissionError,
-            OSError,
-        ):
-            self.engine = None
+            self.root.tk.call("source", str(theme_path))
+            ttk.Style().theme_use("forest-dark")
+        except tk.TclError:
+            logger.warning("Tema yüklenemedi: %s", theme_path, exc_info=True)
+
+    def on_callback_error(
+        self,
+        exc_type: type[BaseException],
+        exc_value: BaseException,
+        exc_traceback: TracebackType | None,
+    ) -> None:
+        """Tk geri çağrısında yakalanmayan hatayı loglar; kullanıcıya bir kez bildirir."""
+        logger.error(
+            "Arayüz geri çağrısında yakalanmayan hata",
+            exc_info=(exc_type, exc_value, exc_traceback),
+        )
+        if self.callback_error_shown:
+            return
+        self.callback_error_shown = True
+        messagebox.showerror(
+            "Beklenmeyen Hata",
+            "Beklenmeyen bir hata oluştu; uygulama çalışmaya devam etmeye "
+            "çalışacak." + log_hint(),
+        )
 
     def setup_ui(self) -> None:
         """Tüm arayüz bileşenlerini ve düzeni oluşturur."""
-        self.root.rowconfigure(0, minsize=HEIGHT)
-        self.root.columnconfigure(0, minsize=WIDTH + 200)
+        # Menü ve oyun ekranı aynı hücrede üst üste; hücre pencereyle esner.
+        self.root.rowconfigure(0, weight=1)
+        self.root.columnconfigure(0, weight=1)
 
-        # 1. Ana Menü Ekranı (main_frame)
+        # 1. Ana Menü Ekranı (main_frame): içerik pencerenin ortasında
         self.main_frame = tk.Frame(self.root)
         self.main_frame.grid(row=0, column=0, sticky="news")
+        self.menu_box = menu_box = tk.Frame(self.main_frame)
+        menu_box.place(relx=0.5, rely=0.5, anchor="center")
 
-        self.title_label = tk.Label(
-            self.main_frame, text="Chess", font=("", 30, "bold")
-        )
-        self.title_label.pack(pady=(30, 20))
+        tk.Label(menu_box, text="Satranç", font=("", 30, "bold")).pack(pady=(20, 20))
 
-        # Mod Menüsü
-        mode_frame = tk.Frame(self.main_frame, width=200)
-        mode_frame.pack(pady=10)
-        tk.Label(mode_frame, text="Mode:").pack(side=tk.LEFT, padx=5)
-        ttk.OptionMenu(
-            mode_frame, self.mode_var, self.mode_list[0], *self.mode_list
-        ).pack(side=tk.RIGHT, padx=5)
+        for label, var, choices in (
+            ("Mod:", self.mode_var, self.mode_list),
+            ("Süre:", self.time_var, self.time_list),
+            ("Seviye (ELO):", self.elo_var, self.elo_list),
+            ("Taraf:", self.side_var, self.side_list),
+        ):
+            row = tk.Frame(menu_box)
+            row.pack(pady=10)
+            tk.Label(row, text=label).pack(side=tk.LEFT, padx=5)
+            ttk.OptionMenu(row, var, var.get(), *choices).pack(side=tk.RIGHT, padx=5)
 
-        # Zaman Menüsü
-        time_frame = tk.Frame(self.main_frame)
-        time_frame.pack(pady=10)
-        tk.Label(time_frame, text="Time:").pack(side=tk.LEFT, padx=5)
-        ttk.OptionMenu(
-            time_frame, self.time_var, self.time_list[0], *self.time_list
-        ).pack(side=tk.RIGHT, padx=5)
-
-        # ELO Menüsü
-        elo_frame = tk.Frame(self.main_frame)
-        elo_frame.pack(pady=10)
-        tk.Label(elo_frame, text="Rating:").pack(side=tk.LEFT, padx=5)
-        ttk.OptionMenu(
-            elo_frame, self.elo_var, self.elo_list[3], *self.elo_list
-        ).pack(side=tk.RIGHT, padx=5)
-
-        # Taraf Seçimi
-        side_frame = tk.Frame(self.main_frame)
-        side_frame.pack(pady=10)
-        tk.Label(side_frame, text="Side:").pack(side=tk.LEFT, padx=5)
-        ttk.OptionMenu(
-            side_frame, self.side_var, self.side_list[0], *self.side_list
-        ).pack(side=tk.RIGHT, padx=5)
-
-        # Oyna Butonu
         ttk.Button(
-            self.main_frame,
-            text="Play",
+            menu_box,
+            text="Oyna",
             style="Accent.TButton",
             command=self.play,
-        ).pack(pady=(50, 0))
+        ).pack(pady=(40, 20))
 
         # 2. Oyun Ekranı (game_frame)
         self.game_frame = tk.Frame(self.root)
         self.game_frame.grid(row=0, column=0, sticky="nsew")
         self.main_frame.tkraise()
 
-        self.chessboard = tk.Canvas(self.game_frame, width=WIDTH, height=HEIGHT)
-        self.chessboard.pack(anchor="center", side=tk.LEFT)
+        self.board_view = BoardView(
+            self.game_frame,
+            WIDTH,
+            get_resource_path("assets") / "images" / "imgs-128px",
+            can_interact=lambda: self.game.can_player_move,
+            on_move=self.try_move,
+        )
+        self.board_view.canvas.pack(anchor="center", side=tk.LEFT)
 
-        sidebar_frame = tk.Frame(self.game_frame)
+        self.sidebar_frame = sidebar_frame = tk.Frame(self.game_frame)
         sidebar_frame.pack(side=tk.RIGHT, fill="both", expand=True)
 
+        # Üst saat rakibin, alt saat oyuncunun (alttaki tarafın) süresidir.
         top_frame = tk.Frame(sidebar_frame)
-        top_frame.pack(side=tk.TOP, fill="x", expand=True)
-        self.b_time = tk.Label(
-            top_frame,
-            text="10:00",
-            bg="black",
-            fg="white",
-            font=("Calibri", WIDTH // 20, "bold"),
-        )
-        self.b_time.pack(side=tk.LEFT)
-
-        log_frame = tk.Frame(sidebar_frame)
-        log_frame.pack(expand=True, fill="both")
-        self.move_log = tk.Label(
-            log_frame, text="", anchor=tk.NW, font=("Calibri", 17)
-        )
-        self.move_log.pack()
+        top_frame.pack(side=tk.TOP, fill="x")
+        self.top_clock = self.make_clock_label(top_frame)
 
         bottom_frame = tk.Frame(sidebar_frame)
-        bottom_frame.pack(side=tk.BOTTOM, fill="x", expand=True)
-        self.w_time = tk.Label(
-            bottom_frame,
-            text="10:00",
-            bg="black",
-            fg="white",
-            font=("Calibri", WIDTH // 20, "bold"),
-        )
-        self.w_time.pack(side=tk.LEFT)
+        bottom_frame.pack(side=tk.BOTTOM, fill="x")
+        self.bottom_clock = self.make_clock_label(bottom_frame)
 
-        # Event Bağlantıları
-        self.chessboard.bind("<Button-1>", self.on_click)
+        controls_frame = tk.Frame(sidebar_frame)
+        controls_frame.pack(side=tk.BOTTOM, fill="x", pady=8)
+        ttk.Button(
+            controls_frame, text="Yeni Oyun", command=self.on_new_game
+        ).pack(side=tk.LEFT, padx=(0, 4), expand=True, fill="x")
+        ttk.Button(
+            controls_frame, text="Ana Menü", command=self.on_menu
+        ).pack(side=tk.LEFT, padx=(4, 8), expand=True, fill="x")
+
+        self.status_label = tk.Label(
+            sidebar_frame, text="", anchor=tk.W, justify=tk.LEFT
+        )
+        self.status_label.pack(side=tk.TOP, fill="x", pady=(8, 4))
+
+        # Hamle Kaydı: hamle numarası başına bir satır, kaydırılabilir
+        log_frame = tk.Frame(sidebar_frame)
+        log_frame.pack(side=tk.TOP, expand=True, fill="both", padx=(0, 8))
+        self.move_log = ttk.Treeview(
+            log_frame,
+            columns=("no", "white", "black"),
+            show="headings",
+            selectmode="none",
+            height=MOVE_LOG_ROWS,
+        )
+        self.move_log.heading("no", text="#")
+        self.move_log.heading("white", text="Beyaz")
+        self.move_log.heading("black", text="Siyah")
+        self.move_log.column("no", width=36, minwidth=30, stretch=False, anchor=tk.E)
+        self.move_log.column("white", width=70, minwidth=50)
+        self.move_log.column("black", width=70, minwidth=50)
+        log_scroll = ttk.Scrollbar(
+            log_frame, orient=tk.VERTICAL, command=self.move_log.yview
+        )
+        self.move_log.configure(yscrollcommand=log_scroll.set)
+        log_scroll.pack(side=tk.RIGHT, fill="y")
+        self.move_log.pack(side=tk.LEFT, expand=True, fill="both")
+
         self.root.bind("<Configure>", self.on_resize)
 
+    def make_clock_label(self, parent: tk.Misc) -> tk.Label:
+        # En uzun süre metniyle başlar ki yan panel genişliği doğru ölçülsün.
+        longest = max(initial for initial, _ in TIME_CONTROLS.values())
+        label = tk.Label(
+            parent,
+            text=format_clock(longest),
+            bg="black",
+            fg="white",
+            font=("Calibri", clock_font_size(self.board_view.size), "bold"),
+        )
+        label.pack(side=tk.LEFT)
+        return label
+
+    def fit_window(self) -> None:
+        """Pencerenin ilk ve en küçük boyutunu yan panelin gerçek ihtiyacına göre ayarlar.
+
+        Yan panelin genişliği temaya ve yazı tipine bağlıdır; sabit bir değer
+        varsaymak küçük pencerede sağ tarafı kırpıyordu. En küçük pencerede
+        tahta `MIN_BOARD_SIZE` olur ve yan panel ile menü tam sığar.
+        """
+        self.root.update_idletasks()
+        sidebar_width = self.sidebar_frame.winfo_reqwidth()
+        min_height = max(
+            MIN_BOARD_SIZE,
+            self.sidebar_frame.winfo_reqheight(),
+            self.menu_box.winfo_reqheight(),
+        )
+        min_width = max(
+            MIN_BOARD_SIZE + sidebar_width, self.menu_box.winfo_reqwidth()
+        )
+        self.root.minsize(min_width, min_height)
+        self.root.geometry(f"{WIDTH + sidebar_width}x{max(HEIGHT, min_height)}")
+
+    def board_size_for(self, width: int, height: int) -> int:
+        """Pencere boyutunda, yan panele yer bırakarak sığan en büyük tahta."""
+        available = width - self.sidebar_frame.winfo_reqwidth()
+        return max(MIN_BOARD_SIZE, min(available, height))
+
+    def selected_elo(self) -> int:
+        try:
+            return int(self.elo_var.get())
+        except ValueError:
+            return DEFAULT_ELO
+
     def play(self) -> None:
-        """Oyunu başlatır ve seçilen ayarları uygular."""
-        self.game_frame.tkraise()
-        self.player_side = self.side_var.get() == "white"
-        self.game_mode = self.mode_var.get()
-
-        if self.game_mode == "Stockfish":
-            engine = self.engine
-            if engine is None:
-                messagebox.showerror(
-                    "Motor Hatası",
-                    "Stockfish motoru başlatılamadı. Lütfen iki kişilik (Player) modda oynayın.",
-                )
-                self.main_frame.tkraise()
-                return
-
-            try:
-                raw_elo = self.elo_var.get()
-                elo_val = int(raw_elo) if raw_elo else 1300
-            except (ValueError, TypeError):
-                elo_val = 1300
-
-            elo = max(elo_val, 1350)
-            skill_idx = (
-                self.elo_list.index(self.elo_var.get())
-                if self.elo_var.get() in self.elo_list
-                else 0
+        """Menüdeki ayarlarla oyunu başlatır; Stockfish modunda motoru hazırlar."""
+        mode = GameMode(self.mode_var.get())
+        if mode is GameMode.STOCKFISH and not (
+            self.engine.ensure() and self.engine.configure(self.selected_elo())
+        ):
+            messagebox.showerror(
+                "Motor Hatası",
+                "Stockfish bulunamadı ya da başlatılamadı.\n\n"
+                "macOS'ta `brew install stockfish` ile kurabilir veya "
+                f"{ENGINE_ENV_VAR} ortam değişkeniyle motorun yolunu "
+                "belirtebilirsiniz. Bu arada iki kişilik modda "
+                "oynayabilirsiniz." + log_hint(),
             )
-            try:
-                engine.configure({
-                    "Skill Level": skill_idx,
-                    "UCI_LimitStrength": "false",
-                    "UCI_Elo": elo,
-                })
-            except (
-                chess.engine.EngineError,
-                chess.engine.EngineTerminatedError,
-                OSError,
-            ):
-                pass
+            return
 
+        self.game_frame.tkraise()
         self.restart()
 
+    def new_game_id(self) -> int:
+        self.last_game_id += 1
+        return self.last_game_id
+
     def restart(self) -> None:
-        """Tahtayı ve zamanlayıcıları sıfırlayarak yeni oyun başlatır."""
+        """Menüdeki ayarlarla tahtayı ve saati sıfırlayıp yeni oyun başlatır."""
+        self.game.stop()
+        self.game = Game(
+            self.new_game_id(),
+            mode=GameMode(self.mode_var.get()),
+            player_side=SIDE_CHOICES.get(self.side_var.get(), chess.WHITE),
+            time_control=self.time_var.get(),
+        )
         self.is_stockfish_thinking = False
-        self.board = chess.Board()
-        self.moves = []
-        self.legal_moves = []
-        self.move_log["text"] = ""
-        self.is_resume = True
+        self.engine_restarts = 0
+        self.move_log.delete(*self.move_log.get_children())
+        logger.info(
+            "Yeni oyun: mod=%s süre=%s taraf=%s ELO=%s",
+            self.game.mode,
+            self.time_var.get(),
+            self.side_var.get(),
+            self.selected_elo() if self.game.mode is GameMode.STOCKFISH else "-",
+        )
 
-        time_val = self.time_var.get()
-        if time_val == "1+0":
-            self.white_time = 60
-            self.black_time = 60
-            self.time_plus = 0
-        elif time_val == "3+2":
-            self.white_time = 180
-            self.black_time = 180
-            self.time_plus = 2
-        elif time_val == "10+0":
-            self.white_time = 600
-            self.black_time = 600
-            self.time_plus = 0
-
+        self.game.start()
+        self.board_view.show(self.game.board, self.game.player_side)
         self.update_time_display()
-        self.redraw()
+        self.update_status()
 
-        if self.game_mode == "Stockfish" and self.board.turn != self.player_side:
+        if self.game.is_engine_turn:
             self.root.after(500, self.stockfish_turn)
 
+    def confirm_abandon(self, title: str, question: str) -> bool:
+        """Süren oyun varsa bırakmak için onay ister; soru açıkken saat durur."""
+        if not self.game.in_progress:
+            return True
+        clock = self.game.clock
+        running = clock.running
+        clock.stop()
+        confirmed = messagebox.askyesno(title, question)
+        if not confirmed and running is not None:
+            clock.start(running)
+        return confirmed
+
+    def on_new_game(self) -> None:
+        """Aynı ayarlarla yeni oyun başlatır; süren oyun varsa onay ister."""
+        if not self.confirm_abandon(
+            "Yeni Oyun", "Oyun devam ediyor. Yeni oyun başlatılsın mı?"
+        ):
+            return
+        # play() motoru da yoklar; ölmüşse yeniden başlatır.
+        self.play()
+
+    def on_menu(self) -> None:
+        """Ana menüye döner; süren oyun varsa onay ister."""
+        if not self.confirm_abandon(
+            "Ana Menü", "Oyun devam ediyor. Oyunu bırakıp menüye dönülsün mü?"
+        ):
+            return
+        self.game.stop()
+        # Yeni kimlik: eski oyuna ait motor sonuçları ve bekleyen uyarılar atılır.
+        self.game = Game(self.new_game_id())
+        self.is_stockfish_thinking = False
+        self.board_view.clear_selection()
+        self.main_frame.tkraise()
+
     def update_time_display(self) -> None:
-        """Zamanlayıcı etiketlerini günceller."""
-        w_str = f"{self.white_time // 60}:{self.white_time % 60:0>2}"
-        b_str = f"{self.black_time // 60}:{self.black_time % 60:0>2}"
-        if self.player_side:
-            self.w_time["text"] = w_str
-            self.b_time["text"] = b_str
+        """Saat etiketlerini günceller; oyuncunun tarafı altta gösterilir."""
+        clock = self.game.clock
+        side = self.game.player_side
+        self.bottom_clock["text"] = format_clock(clock.time_left(side))
+        self.top_clock["text"] = format_clock(clock.time_left(not side))
+
+    def update_status(self) -> None:
+        """Sıranın kimde olduğunu ve motorun durumunu gösterir."""
+        if self.is_stockfish_thinking:
+            text = "Stockfish düşünüyor…"
         else:
-            self.w_time["text"] = b_str
-            self.b_time["text"] = w_str
+            board = self.game.board
+            text = f"Sıra: {COLOR_NAMES[board.turn]}"
+            if board.is_check():
+                text += " (Şah!)"
+        self.status_label["text"] = text
 
     def time_update(self) -> None:
-        """Saniyede bir çalışarak sırası gelen tarafın süresini düşürür."""
-        if self.is_resume:
-            if self.board.turn == chess.WHITE:
-                self.white_time -= 1
-                if self.white_time <= 0:
-                    self.handle_timeout("Siyah")
-            else:
-                self.black_time -= 1
-                if self.black_time <= 0:
-                    self.handle_timeout("Beyaz")
+        """Saat ekranını yeniler ve süre bitimini yakalar.
 
-            self.update_time_display()
+        Süreyi kendisi düşmez; GameClock gerçek zamanla ölçer. Bu döngü
+        gecikse bile (ör. macOS arka planda yavaşlatınca) hesap doğru kalır.
+        """
+        self.after_time_id = self.root.after(CLOCK_TICK_MS, self.time_update)
+        if not self.game.running:
+            return
+        self.update_time_display()
+        if self.game.check_flag():
+            self.show_game_over()
 
-        if self.white_time > 0 and self.black_time > 0:
-            self.after_time_id = self.root.after(1000, self.time_update)
-
-    def handle_timeout(self, winner: str) -> None:
-        """Süre bittiğinde mesaj gösterir."""
-        self.is_resume = False
-        result = messagebox.askretrycancel(
-            "Süre Bitti!",
-            f"{winner} kazandı. Yeniden başlatmak ister misiniz?",
+    def show_game_over(self) -> None:
+        """Bitmiş oyunun sonucunu gösterir; tahta görünür kalır."""
+        game = self.game
+        message = game.result or "Oyun bitti."
+        self.is_stockfish_thinking = False
+        self.board_view.clear_selection()
+        self.board_view.redraw()
+        self.update_time_display()
+        self.status_label["text"] = message
+        logger.info(
+            "Oyun bitti: %s | hamleler: %s",
+            message,
+            " ".join(move.uci() for move in game.board.move_stack),
         )
-        if result:
-            self.restart()
-        elif self.after_time_id:
-            try:
-                self.root.after_cancel(self.after_time_id)
-            except (tk.TclError, RuntimeError):
-                pass
-            self.after_time_id = None
+        self.show_dialog_later(messagebox.showinfo, "Oyun Bitti", message)
 
-    def draw_board(self) -> None:
-        """Satranç tahtası karelerini ve koordinat yazılarını çizer."""
-        coords: list[tuple[int, int]] = []
-        if self.moves:
-            last_move = self.moves[-1]
-            for sq in (last_move.from_square, last_move.to_square):
-                f = chess.square_file(sq)
-                r = chess.square_rank(sq)
-                col = f if self.player_side else 7 - f
-                row = 7 - r if self.player_side else r
-                coords.append((row, col))
+    def show_dialog_later(
+        self, show: Callable[[str, str], object], title: str, message: str
+    ) -> None:
+        """Uyarıyı, olay döngüsü ekranı çizdikten sonra açar.
 
-        for row in range(ROWS):
-            for col in range(COLS):
-                color = WCOLOR if (row + col) % 2 == 0 else BCOLOR
-                if (row, col) in coords:
-                    color = MWHITE if (row + col) % 2 == 0 else MBLACK
-                self.chessboard.create_rectangle(
-                    col * SQSIZE,
-                    row * SQSIZE,
-                    (col + 1) * SQSIZE,
-                    (row + 1) * SQSIZE,
-                    fill=color,
-                    width=0,
-                    tags="rect",
-                )
+        macOS'ta yerel uyarı penceresi açıkken Tk ekranı boyamaz; son hamle ve
+        durum metni görünsün diye uyarı ertelenir. Bu arada yeni oyun
+        başladıysa uyarı hiç açılmaz.
+        """
+        game = self.game
 
-        alphabet_list = ALPHABET if self.player_side else ALPHABET[::-1]
-        for i, file_letter in enumerate(alphabet_list):
-            i_color = BCOLOR if i % 2 == 0 else WCOLOR
-            a_color = WCOLOR if i % 2 == 0 else BCOLOR
-            rank_number = str(8 - i) if self.player_side else str(i + 1)
+        def show_now() -> None:
+            if game is self.game:
+                show(title, message)
 
-            self.chessboard.create_text(
-                SQSIZE // 6,
-                i * SQSIZE + SQSIZE // 6,
-                text=rank_number,
-                fill=i_color,
-                font=("Calibri", SQSIZE // 6),
-                tags="text",
-            )
-            self.chessboard.create_text(
-                (i + 1) * SQSIZE - SQSIZE // 6,
-                HEIGHT - SQSIZE // 6,
-                text=file_letter,
-                fill=a_color,
-                font=("Calibri", SQSIZE // 6),
-                tags="text",
-            )
+        self.root.after(100, show_now)
 
-    def draw_pieces(self) -> None:
-        """Taşları doğrudan python-chess tahta modelinden okuyarak çizer (Model Birleştirme)."""
-        for row in range(ROWS):
-            for col in range(COLS):
-                sq = (
-                    chess.square(col, 7 - row)
-                    if self.player_side
-                    else chess.square(7 - col, row)
-                )
-                piece = self.board.piece_at(sq)
-                if piece is not None:
-                    piece_type = PIECE_TYPE_NAMES[piece.piece_type]
-                    color_name = (
-                        "white" if piece.color == chess.WHITE else "black"
-                    )
-                    img = self.re_images.get(f"{piece_type}_{color_name}")
-                    if img:
-                        self.chessboard.create_image(
-                            col * SQSIZE,
-                            row * SQSIZE,
-                            image=img,
-                            anchor=tk.NW,
-                            tags=piece_type,
-                        )
-
-    def draw_legal_moves(self) -> None:
-        """Seçili taş için hedef yasal hamle noktalarını çizer."""
-        size = SQSIZE // 3
-        for move in self.legal_moves:
-            target_sq = move.to_square
-            target_file = chess.square_file(target_sq)
-            target_rank = chess.square_rank(target_sq)
-
-            col = target_file if self.player_side else 7 - target_file
-            row = 7 - target_rank if self.player_side else target_rank
-
-            x = col * SQSIZE + SQSIZE // 2
-            y = row * SQSIZE + SQSIZE // 2
-            self.chessboard.create_oval(
-                x - size // 2,
-                y - size // 2,
-                x + size // 2,
-                y + size // 2,
-                fill=HCOLOR,
-                width=0,
-                tags="circle",
-            )
-
-    def redraw(self) -> None:
-        """Tahtayı ve taşları baştan temizleyip çizer."""
-        self.chessboard.delete("all")
-        self.draw_board()
-        self.draw_pieces()
-
-    def on_drag(self, e: tk.Event) -> None:
-        """Sürüklenen taşı fare imlecini ortalayarak hareket ettirir."""
-        if self.closest is not None:
-            self.chessboard.moveto(
-                self.closest, x=e.x - SQSIZE // 2, y=e.y - SQSIZE // 2
-            )
-            self.chessboard.tag_bind(
-                self.closest, "<ButtonRelease-1>", self.on_release
-            )
-            self.chessboard.tag_raise(self.closest)
-
-    def on_click(self, e: tk.Event) -> None:
-        """Kullanıcının tahtaya tıklama olayını yönetir."""
-        if not self.is_resume:
-            return
-        if (
-            self.game_mode == "Stockfish"
-            and self.board.turn != self.player_side
-        ):
-            return
-
-        items = self.chessboard.find_closest(e.x, e.y)
-        if not items:
-            return
-        self.closest = items[0]
-        tags = self.chessboard.gettags(self.closest)
-        if not tags or tags[0] in ("rect", "text", "circle"):
-            return
-
-        item_coords = self.chessboard.coords(self.closest)
-        if not item_coords:
-            return
-
-        col = int(item_coords[0] // SQSIZE)
-        row = int(item_coords[1] // SQSIZE)
-        self.prev_col = col
-        self.prev_row = row
-
-        source_sq = (
-            chess.square(col, 7 - row)
-            if self.player_side
-            else chess.square(7 - col, row)
-        )
-        piece = self.board.piece_at(source_sq)
-
-        if piece is None or piece.color != self.board.turn:
-            return
-
-        # Yasal hamleleri tek bir döngüde topla (Mükerrer döngü kaldırıldı)
-        self.legal_moves = [
-            m for m in self.board.legal_moves if m.from_square == source_sq
+    def try_move(self, source: chess.Square, target: chess.Square) -> None:
+        """Kullanıcının hamlesini oynar; gerekirse terfi taşını sorar."""
+        game = self.game
+        candidates = [
+            m
+            for m in game.board.legal_moves
+            if m.from_square == source and m.to_square == target
         ]
-
-        self.draw_legal_moves()
-        self.chessboard.tag_bind(self.closest, "<B1-Motion>", self.on_drag)
-        self.chessboard.tag_raise(self.closest)
-
-    def on_release(self, e: tk.Event) -> None:
-        """Taş bırakıldığında hamlenin geçerliliğini denetler ve uygular."""
-        if (
-            self.closest is None
-            or self.prev_col is None
-            or self.prev_row is None
-        ):
+        if not candidates:
             return
+        move = candidates[0]
 
-        col = int(e.x // SQSIZE)
-        row = int(e.y // SQSIZE)
+        if move.promotion is not None:
+            promotion = self.prompt_promotion()
+            # Terfi penceresi açıkken süre bitmiş ya da oyun değişmiş olabilir.
+            if game is not self.game or not game.running:
+                return
+            if promotion is None:
+                self.board_view.clear_selection()
+                self.board_view.redraw()
+                return
+            move = chess.Move(source, target, promotion=promotion)
 
-        if 0 <= col < COLS and 0 <= row < ROWS:
-            source_sq = (
-                chess.square(self.prev_col, 7 - self.prev_row)
-                if self.player_side
-                else chess.square(7 - self.prev_col, self.prev_row)
-            )
-            target_sq = (
-                chess.square(col, 7 - row)
-                if self.player_side
-                else chess.square(7 - col, row)
-            )
+        self.push_move(move)
 
-            normal_move = chess.Move(source_sq, target_sq)
-            promo_move = chess.Move(source_sq, target_sq, promotion=chess.QUEEN)
-
-            if normal_move in self.board.legal_moves:
-                self.execute_player_move(normal_move, col, row)
-            elif promo_move in self.board.legal_moves:
-                chosen_piece = self.prompt_promotion()
-                if chosen_piece is not None:
-                    final_move = chess.Move(
-                        source_sq, target_sq, promotion=chosen_piece
-                    )
-                    self.execute_player_move(final_move, col, row)
-                else:
-                    self.chessboard.moveto(
-                        self.closest,
-                        self.prev_col * SQSIZE,
-                        self.prev_row * SQSIZE,
-                    )
-            else:
-                self.chessboard.moveto(
-                    self.closest, self.prev_col * SQSIZE, self.prev_row * SQSIZE
-                )
-        else:
-            self.chessboard.moveto(
-                self.closest, self.prev_col * SQSIZE, self.prev_row * SQSIZE
-            )
-
-        self.chessboard.tag_unbind(self.closest, "<B1-Motion>")
-        self.legal_moves = []
-        self.redraw()
-
-    def prompt_promotion(self) -> int | None:
+    def prompt_promotion(self) -> chess.PieceType | None:
         """Terfi seçimi penceresini açar."""
-        popup = Popup(self.root, self.player_side, self.re_images)
+        # İki kişilik modda terfi eden taraf, tahtanın alttaki tarafı olmayabilir.
+        popup = Popup(self.root, self.game.board.turn, self.board_view.piece_images)
         self.root.wait_window(popup)
         choice_map = {
             "q": chess.QUEEN,
@@ -742,177 +444,124 @@ class ChessApp:
         }
         return choice_map.get(popup.choice) if popup.choice else None
 
-    def execute_player_move(
-        self, move: chess.Move, col: int, row: int
-    ) -> None:
-        """Geçerli hamleyi tahtaya ve geçmişe işler."""
-        if self.board.turn == chess.WHITE:
-            self.white_time += self.time_plus
+    def push_move(self, move: chess.Move) -> None:
+        """Hamleyi oyuna işler, ekranı günceller ve sırayı sonraki tarafa verir."""
+        record = self.game.push(move)
+        if record is not None:
+            self.append_move_log(record)
+            self.board_view.show(self.game.board, self.game.player_side)
+            self.update_time_display()
+            self.update_status()
+
+        if self.game.result is not None:
+            self.show_game_over()
+        elif self.game.is_engine_turn:
+            self.root.after(300, self.stockfish_turn)
+
+    def append_move_log(self, record: MoveRecord) -> None:
+        """Hamleyi kayda ekler: beyaz yeni satır açar, siyah son satırı tamamlar."""
+        rows = self.move_log.get_children()
+        if record.color == chess.BLACK and rows:
+            row = rows[-1]
+            self.move_log.set(row, "black", record.san)
         else:
-            self.black_time += self.time_plus
-
-        self.update_time_display()
-        self.board.push(move)
-        self.moves.append(move)
-        self.move_log["text"] = chess.Board().variation_san(self.moves)
-
-        if self.closest is not None:
-            self.chessboard.moveto(self.closest, col * SQSIZE, row * SQSIZE)
-            self.chessboard.tag_raise(self.closest)
-
-        self.check_game_status()
-
-    def check_game_status(self) -> None:
-        """Mat, pat ve berabere durumlarını denetler."""
-        result = None
-        self.is_resume = False
-
-        if self.board.is_checkmate():
-            result = messagebox.askretrycancel(
-                "Şah mat!", "Yeniden başlatmak ister misiniz?"
+            white = record.san if record.color == chess.WHITE else "…"
+            black = "" if record.color == chess.WHITE else record.san
+            row = self.move_log.insert(
+                "", tk.END, values=(f"{record.number}.", white, black)
             )
-        elif self.board.is_stalemate():
-            result = messagebox.askretrycancel(
-                "Pat!", "Yeniden başlatmak ister misiniz?"
-            )
-        elif self.board.is_variant_draw() or self.board.is_insufficient_material():
-            result = messagebox.askretrycancel(
-                "Berabere!", "Yeniden başlatmak ister misiniz?"
-            )
-
-        self.is_resume = True
-
-        if result is not None:
-            if result:
-                self.restart()
-            else:
-                self.is_resume = False
-                if self.after_time_id:
-                    try:
-                        self.root.after_cancel(self.after_time_id)
-                    except (tk.TclError, RuntimeError):
-                        pass
-                    self.after_time_id = None
-        elif (
-            self.game_mode == "Stockfish"
-            and self.board.turn != self.player_side
-            and self.is_resume
-        ):
-            self.root.after(500, self.stockfish_turn)
+        self.move_log.see(row)
 
     def stockfish_turn(self) -> None:
-        """Stockfish hamle hesaplamasını arka planda (Worker Thread) başlatır."""
-        engine = self.engine
-        if not self.is_resume or self.game_mode != "Stockfish" or engine is None:
-            return
-
+        """Sıra motordaysa hamle aramasını arka planda başlatır."""
+        game = self.game
         if (
-            self.board.turn != self.player_side
-            and not self.is_stockfish_thinking
-            and not self.board.is_game_over()
+            self.is_stockfish_thinking
+            or not game.is_engine_turn
+            or game.board.is_game_over()
         ):
-            self.is_stockfish_thinking = True
-            board_copy = self.board.copy()
-            depth_idx = (
-                self.elo_list.index(self.elo_var.get())
-                if self.elo_var.get() in self.elo_list
-                else 0
-            )
-            current_depth = (
-                self.depth_list[depth_idx]
-                if depth_idx < len(self.depth_list)
-                else 1
-            )
-
-            def run_engine() -> None:
-                try:
-                    res = engine.play(
-                        board_copy,
-                        chess.engine.Limit(time=1, depth=current_depth),
-                    )
-                    best_move = res.move
-                    self.root.after(
-                        0, lambda m=best_move: self.apply_stockfish_move(m)
-                    )
-                except (
-                    chess.engine.EngineError,
-                    chess.engine.EngineTerminatedError,
-                    OSError,
-                ):
-                    self.root.after(0, self.handle_stockfish_error)
-
-            threading.Thread(target=run_engine, daemon=True).start()
-
-    def handle_stockfish_error(self) -> None:
-        """Motor hesaplama hatası durumunu yönetir."""
-        self.is_stockfish_thinking = False
-
-    def apply_stockfish_move(self, move: chess.Move | None) -> None:
-        """Motor hamlesini UI thread üzerinde uygular."""
-        self.is_stockfish_thinking = False
-        if not self.is_resume or move is None or self.game_mode != "Stockfish":
             return
+        if not self.engine.search(
+            game.board,
+            game.id,
+            game.clock.time_left(game.board.turn),
+            game.clock.increment,
+        ):
+            self.handle_engine_failure()
+            return
+        self.is_stockfish_thinking = True
+        self.update_status()
 
-        self.board.push(move)
-        self.moves.append(move)
-        self.move_log["text"] = chess.Board().variation_san(self.moves)
-        self.redraw()
-        self.check_game_status()
+    def poll_engine(self) -> None:
+        """Motor sonuçlarını ana thread'de düzenli olarak okur."""
+        self.after_poll_id = self.root.after(ENGINE_POLL_MS, self.poll_engine)
+        for game_id, move in self.engine.poll():
+            self.apply_stockfish_move(game_id, move)
+
+    def apply_stockfish_move(self, game_id: int, move: chess.Move | None) -> None:
+        """Motor hamlesini uygular; eski oyunlardan gelenleri atar."""
+        if game_id != self.game.id:
+            return
+        self.is_stockfish_thinking = False
+        if not self.game.is_engine_turn:
+            # Motor düşünürken süre bitmiş olabilir.
+            return
+        if move is None or move not in self.game.board.legal_moves:
+            if move is not None:
+                logger.warning("Motor yasal olmayan hamle döndürdü: %s", move)
+            self.handle_engine_failure()
+            return
+        self.engine_restarts = 0
+        self.push_move(move)
+
+    def handle_engine_failure(self) -> None:
+        """Motor hamle üretemedi: yeniden başlatıp tekrar dener, olmazsa oyunu durdurur."""
+        if self.engine_restarts < MAX_ENGINE_RESTARTS:
+            self.engine_restarts += 1
+            logger.warning(
+                "Stockfish hamle üretemedi; yeniden başlatılıyor (%s/%s)",
+                self.engine_restarts,
+                MAX_ENGINE_RESTARTS,
+            )
+            self.engine.shutdown()
+            if self.engine.ensure() and self.engine.configure(self.selected_elo()):
+                self.status_label["text"] = "Stockfish yeniden başlatıldı…"
+                self.root.after(300, self.stockfish_turn)
+                return
+
+        logger.error("Stockfish yeniden başlatılamadı; oyun durduruldu")
+        self.game.stop()
+        self.status_label["text"] = "Stockfish hata verdi; oyun durduruldu."
+        self.show_dialog_later(
+            messagebox.showerror,
+            "Motor Hatası",
+            "Stockfish yanıt vermiyor ve yeniden başlatılamadı. Oyun durduruldu.\n\n"
+            "'Yeni Oyun' ile tekrar deneyebilir ya da 'Ana Menü'den iki kişilik "
+            "moda geçebilirsiniz." + log_hint(),
+        )
 
     def on_resize(self, e: tk.Event) -> None:
-        """Pencere boyutu değiştiğinde tahta ve bileşenleri yeniden boyutlandırır."""
+        """Pencere boyutu değiştiğinde tahtayı ve saat yazılarını ölçekler."""
         if not isinstance(e.widget, tk.Tk):
             return
-
-        global WIDTH, HEIGHT, SQSIZE
-        new_dim = min(int(e.width), int(e.height))
-        if new_dim < 200:
-            return
-
-        WIDTH = new_dim
-        HEIGHT = new_dim
-        SQSIZE = WIDTH // ROWS
-
-        self.chessboard.configure(width=WIDTH, height=HEIGHT)
-        self.w_time.configure(font=("Calibri", WIDTH // 20, "bold"))
-        self.b_time.configure(font=("Calibri", WIDTH // 20, "bold"))
-        self.move_log.configure(wraplength=max((e.width - WIDTH) - 30, 100))
-        self.title_label.pack_configure(pady=(HEIGHT // 8, 30))
-
-        self.root.rowconfigure(0, minsize=e.height)
-        self.root.columnconfigure(0, minsize=e.width)
-
-        self.resize_pieces()
-        self.redraw()
+        size = self.board_size_for(int(e.width), int(e.height))
+        self.board_view.resize(size)
+        for label in (self.top_clock, self.bottom_clock):
+            label.configure(font=("Calibri", clock_font_size(size), "bold"))
 
     def on_closing(self) -> None:
-        """Pencere kapatıldığında tüm kaynakları ve motor süreçlerini temizler."""
-        self.is_resume = False
-        if self.after_time_id is not None:
+        """Pencere kapatıldığında zamanlayıcıları ve motor sürecini temizler."""
+        self.game.stop()
+        for after_id in (self.after_time_id, self.after_poll_id):
+            if after_id is None:
+                continue
             try:
-                self.root.after_cancel(self.after_time_id)
+                self.root.after_cancel(after_id)
             except (tk.TclError, RuntimeError):
                 pass
-            self.after_time_id = None
-
-        if self.engine is not None:
-            try:
-                self.engine.quit()
-            except (
-                chess.engine.EngineError,
-                chess.engine.EngineTerminatedError,
-                OSError,
-            ):
-                pass
-            try:
-                self.engine.close()
-            except (
-                chess.engine.EngineError,
-                chess.engine.EngineTerminatedError,
-                OSError,
-            ):
-                pass
-            self.engine = None
+        self.after_time_id = None
+        self.after_poll_id = None
+        self.engine.shutdown()
 
         try:
             self.root.destroy()
@@ -928,6 +577,14 @@ class ChessApp:
 
 
 def start_game() -> None:
+    log_path = setup_logging()
+    logger.info(
+        "mychess başlıyor: Python %s, Tk %s, %s, log: %s",
+        sys.version.split()[0],
+        tk.TkVersion,
+        sys.platform,
+        log_path,
+    )
     app = ChessApp()
     app.run()
 

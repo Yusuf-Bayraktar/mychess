@@ -2,7 +2,8 @@
 
 # The Forest theme is a beautiful and modern ttk theme inspired by Excel.
 
-package require Tk 8.6
+# mychess: "8.6-" = 8.6 veya üstü; uv'nin Python 3.14'ü Tk 9.0 ile gelir.
+package require Tk 8.6-
 
 namespace eval ttk::theme::forest-dark {
 

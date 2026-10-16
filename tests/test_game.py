@@ -1,150 +1,153 @@
 import chess
+import pytest
+from fakes import FakeTime
 
-from mychess.board import Board
-from mychess.const import ALPHABET, COLS, PIECES, ROWS, TAGS
-from mychess.main import PIECE_TYPE_NAMES
-from mychess.pieces import Pawn
-from mychess.square import Square
-
-
-def test_constants():
-    assert len(ALPHABET) == 8
-    assert len(PIECES) == 6
-    assert len(TAGS) == 6
-    assert ROWS == 8
-    assert COLS == 8
+from mychess.game import (
+    DEFAULT_TIME_CONTROL,
+    TIME_CONTROLS,
+    Game,
+    GameMode,
+    MoveRecord,
+    outcome_message,
+    timeout_message,
+)
 
 
-def test_piece_type_mapping():
-    assert PIECE_TYPE_NAMES[chess.PAWN] == "pawn"
-    assert PIECE_TYPE_NAMES[chess.KNIGHT] == "knight"
-    assert PIECE_TYPE_NAMES[chess.BISHOP] == "bishop"
-    assert PIECE_TYPE_NAMES[chess.ROOK] == "rook"
-    assert PIECE_TYPE_NAMES[chess.QUEEN] == "queen"
-    assert PIECE_TYPE_NAMES[chess.KING] == "king"
+def play_san(game: Game, *sans: str) -> list[MoveRecord | None]:
+    return [game.push(game.board.parse_san(san)) for san in sans]
 
 
-def test_coordinate_mapping_white_perspective():
-    # When playing as white:
-    # col=0, row=0 -> a8 (file=0, rank=7)
-    # col=4, row=6 -> e2 (file=4, rank=1)
-    # col=7, row=7 -> h1 (file=7, rank=0)
-    col, row = 0, 0
-    sq_a8 = chess.square(col, 7 - row)
-    assert chess.square_name(sq_a8) == "a8"
-
-    col, row = 4, 6
-    sq_e2 = chess.square(col, 7 - row)
-    assert chess.square_name(sq_e2) == "e2"
-
-    col, row = 7, 7
-    sq_h1 = chess.square(col, 7 - row)
-    assert chess.square_name(sq_h1) == "h1"
+def started(
+    fake_time: FakeTime,
+    mode: GameMode = GameMode.PLAYER,
+    player_side: chess.Color = chess.WHITE,
+    time_control: str = DEFAULT_TIME_CONTROL,
+) -> Game:
+    game = Game(1, mode, player_side, time_control, now=fake_time)
+    game.start()
+    return game
 
 
-def test_coordinate_mapping_black_perspective():
-    # When playing as black (board flipped):
-    # col=0, row=0 -> h1 (file=7, rank=0)
-    # col=3, row=1 -> e2 (file=4, rank=1)
-    # col=7, row=7 -> a8 (file=0, rank=7)
-    col, row = 0, 0
-    sq_h1 = chess.square(7 - col, row)
-    assert chess.square_name(sq_h1) == "h1"
+def test_push_records_move_and_presses_clock(fake_time: FakeTime) -> None:
+    game = started(fake_time, time_control="3+2")
+    fake_time.now += 5
 
-    col, row = 3, 1
-    sq_e2 = chess.square(7 - col, row)
-    assert chess.square_name(sq_e2) == "e2"
+    record = game.push(chess.Move.from_uci("e2e4"))
 
-    col, row = 7, 7
-    sq_a8 = chess.square(7 - col, row)
-    assert chess.square_name(sq_a8) == "a8"
+    assert record == MoveRecord(number=1, san="e4", color=chess.WHITE)
+    assert game.clock.running == chess.BLACK
+    assert game.clock.time_left(chess.WHITE) == pytest.approx(177)  # 180 - 5 + 2
 
 
-def test_legal_moves_filtering():
-    board = chess.Board()
-    e2_square = chess.E2
-    legal_moves_from_e2 = [m for m in board.legal_moves if m.from_square == e2_square]
-    
-    # Pawn at e2 can move to e3 or e4
-    destinations = {chess.square_name(m.to_square) for m in legal_moves_from_e2}
-    assert destinations == {"e3", "e4"}
+def test_black_move_record_keeps_move_number(fake_time: FakeTime) -> None:
+    game = started(fake_time)
+    records = play_san(game, "e4", "e5", "Nf3")
+    assert [(r.number, r.color) for r in records if r] == [
+        (1, chess.WHITE),
+        (1, chess.BLACK),
+        (2, chess.WHITE),
+    ]
 
 
-def test_pawn_promotion_moves():
-    # Setup board with white pawn on e7 ready to promote to e8
-    board = chess.Board("8/4P3/8/8/8/8/8/k6K w - - 0 1")
-    e7_square = chess.E7
-    promotion_moves = [m for m in board.legal_moves if m.from_square == e7_square]
+def test_checkmate_finishes_game(fake_time: FakeTime) -> None:
+    game = started(fake_time)
+    records = play_san(game, "f3", "e5", "g4", "Qh4#")
 
-    # Should have 4 promotion options: Q, R, B, N
-    assert len(promotion_moves) == 4
-    promotions = {m.promotion for m in promotion_moves}
-    assert promotions == {chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT}
+    assert records[-1] is not None  # mat hamlesi de kayda girer
+    assert game.result == "Şah mat! Siyah kazandı."
+    assert not game.running
+    assert game.clock.running is None
 
 
-def test_game_status_checkmate():
-    # Fool's Mate (2 moves checkmate)
-    board = chess.Board()
-    board.push_san("f3")
-    board.push_san("e5")
-    board.push_san("g4")
-    board.push_san("Qh4#")
-
-    assert board.is_checkmate() is True
-    assert board.is_game_over() is True
+def test_threefold_repetition_ends_game(fake_time: FakeTime) -> None:
+    game = started(fake_time)
+    play_san(game, "Nf3", "Nf6", "Ng1", "Ng8", "Nf3", "Nf6", "Ng1")
+    # Siyah Ng8 ile üçüncü tekrarı yapabilir ama yapmadı: oyun sürmeli.
+    # (Eski claim_draw=True kontrolü oyunu burada erken bitiriyordu.)
+    assert game.running
+    play_san(game, "Ng8")
+    assert game.result == "Berabere: aynı pozisyon üç kez tekrarlandı."
 
 
-def test_game_status_stalemate():
-    # Famous stalemate position: Black king on a8, white queen on c7, white king on a6
-    board = chess.Board("k7/2Q5/K7/8/8/8/8/8 b - - 0 1")
-    assert board.is_stalemate() is True
-    assert board.is_game_over() is True
+def test_fifty_move_rule_ends_game(fake_time: FakeTime) -> None:
+    game = started(fake_time)
+    game.board.set_fen("4k3/8/8/8/8/8/8/R3K3 w - - 98 80")
+    play_san(game, "Ra2")
+    assert game.running  # 99. yarım hamle: sınır henüz dolmadı
+    play_san(game, "Kd7")
+    assert game.result == "Berabere: 50 hamle kuralı."
 
 
-def test_game_status_insufficient_material():
-    # King vs King
-    board = chess.Board("8/8/8/4k3/8/8/4K3/8 w - - 0 1")
-    assert board.is_insufficient_material() is True
+def test_move_after_flag_fell_is_rejected(fake_time: FakeTime) -> None:
+    game = started(fake_time, time_control="1+0")
+    fake_time.now += 60.5
+
+    assert game.push(chess.Move.from_uci("e2e4")) is None
+    assert game.board.move_stack == []
+    assert game.result == "Süre bitti! Siyah kazandı."
 
 
-def test_time_formatting():
-    def format_time(seconds: int) -> str:
-        return f"{seconds // 60}:{seconds % 60:0>2}"
-
-    assert format_time(600) == "10:00"
-    assert format_time(180) == "3:00"
-    assert format_time(65) == "1:05"
-    assert format_time(9) == "0:09"
-    assert format_time(0) == "0:00"
-
-
-def test_legacy_oop_classes():
-    pawn = Pawn("white")
-    assert pawn.name == "pawn"
-    assert pawn.color == "white"
-    assert pawn.tag == "P"
-
-    square = Square(6, 4, pawn)
-    assert square.has_piece() is True
-    assert square.row == 6
-    assert square.col == 4
-
-    board = Board()
-    assert len(board.board) == 8
-    assert len(board.board[0]) == 8
-    assert board.board[6][4].piece.name == "pawn"
-    assert board.board[7][4].piece.name == "king"
+def test_check_flag(fake_time: FakeTime) -> None:
+    game = started(fake_time, time_control="1+0")
+    fake_time.now += 59
+    assert not game.check_flag()
+    fake_time.now += 1
+    assert game.check_flag()
+    assert game.result == "Süre bitti! Siyah kazandı."
+    assert not game.running
 
 
-def test_resource_and_engine_paths():
-    from mychess.main import get_engine_path, get_resource_path
+def test_stop_freezes_clock_without_result(fake_time: FakeTime) -> None:
+    game = started(fake_time)
+    game.stop()
+    fake_time.now += 1000
+    assert game.result is None
+    assert not game.check_flag()
+    assert not game.can_player_move
 
-    assets_path = get_resource_path("assets")
-    assert assets_path.exists()
-    assert (assets_path / "images" / "imgs-80px").exists()
 
-    theme_path = get_resource_path("ForestTheme/forest-dark.tcl")
-    assert theme_path.exists()
+def test_engine_turn_depends_on_mode_side_and_running(fake_time: FakeTime) -> None:
+    vs_engine = Game(1, GameMode.STOCKFISH, player_side=chess.BLACK, now=fake_time)
+    assert not vs_engine.is_engine_turn  # başlamadı
+    vs_engine.start()
+    assert vs_engine.is_engine_turn
+    assert not vs_engine.can_player_move
 
-    engine_path = get_engine_path()
-    assert engine_path.exists()
+    two_players = started(fake_time, mode=GameMode.PLAYER, player_side=chess.BLACK)
+    assert not two_players.is_engine_turn
+    assert two_players.can_player_move
+
+
+def test_in_progress_needs_a_move(fake_time: FakeTime) -> None:
+    game = started(fake_time)
+    assert not game.in_progress
+    play_san(game, "e4")
+    assert game.in_progress
+
+
+def test_time_controls(fake_time: FakeTime) -> None:
+    for name, (initial, increment) in TIME_CONTROLS.items():
+        game = Game(1, time_control=name, now=fake_time)
+        assert game.clock.time_left(chess.WHITE) == initial
+        assert game.clock.increment == increment
+    # Bilinmeyen kontrol varsayılana düşer
+    assert Game(1, time_control="?", now=fake_time).clock.time_left(chess.WHITE) == 600
+
+
+def test_outcome_messages() -> None:
+    stalemate = chess.Board("k7/2Q5/K7/8/8/8/8/8 b - - 0 1").outcome()
+    assert stalemate is not None
+    assert outcome_message(stalemate) == "Pat! Oyun berabere."
+
+    bare_kings = chess.Board("8/8/8/4k3/8/8/4K3/8 w - - 0 1").outcome()
+    assert bare_kings is not None
+    assert outcome_message(bare_kings) == "Berabere: yetersiz materyal."
+
+
+def test_timeout_messages() -> None:
+    assert timeout_message(chess.Board(), chess.WHITE) == "Süre bitti! Siyah kazandı."
+
+    # Beyazın süresi bitti ama siyahta sadece şah var: berabere
+    lone_king = chess.Board("4k3/8/8/8/8/8/8/R3K3 w - - 0 1")
+    assert "Berabere" in timeout_message(lone_king, chess.WHITE)
+    assert "Beyaz kazandı" in timeout_message(lone_king, chess.BLACK)
