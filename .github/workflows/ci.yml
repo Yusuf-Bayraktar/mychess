@@ -10,8 +10,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
       # Python sürümü .python-version'dan (3.14); uv'nin Python'unda tkinter var.
       - run: uv sync --managed-python --locked
       - run: uv run ruff check .
@@ -26,8 +26,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
 
       # Stockfish: gerçek motor testleri için (yoksa o testler atlanır).
       # Windows'ta repodaki engines/ altındaki .exe kullanılır.
